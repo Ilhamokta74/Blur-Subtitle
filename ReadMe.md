@@ -28,7 +28,7 @@ Siapkan folder seperti ini:
 
 ```
 project/
-├── blur-subtitle-batch.js
+├── Blur.js
 ├── input/        ← taruh semua video di sini
 │   ├── video1.mp4
 │   ├── video2.mp4
@@ -49,7 +49,7 @@ Lalu pindahkan video-video yang mau diproses ke folder `input/`.
 Jalankan dengan pengaturan default:
 
 ```bash
-node blur-subtitle-batch.js
+node Blur.js
 ```
 
 Script akan otomatis:
@@ -91,7 +91,7 @@ Secara default, area yang di-blur diatur untuk video vertikal (576×1024) dengan
 Jika video kamu punya resolusi atau posisi subtitle berbeda, sesuaikan nilainya:
 
 ```bash
-node blur-subtitle-batch.js --x=0 --y=800 --w=1080 --h=200 --sigma=30
+node Blur.js --x=0 --y=800 --w=1080 --h=200 --sigma=30
 ```
 
 **Cara menentukan koordinat yang pas:**
@@ -104,7 +104,7 @@ node blur-subtitle-batch.js --x=0 --y=800 --w=1080 --h=200 --sigma=30
 Kalau tidak mau pakai folder `input/` dan `output/` default:
 
 ```bash
-node blur-subtitle-batch.js --input=./videos-mentah --output=./videos-hasil
+node Blur.js --input=./videos-mentah --output=./videos-hasil
 ```
 
 ## Catatan
