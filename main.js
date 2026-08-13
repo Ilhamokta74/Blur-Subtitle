@@ -12,13 +12,15 @@ function parseArgs(argv) {
     input: "./input",
     output: "./output",
     x: 0,
-    y: 645,
+    y: 550,
     w: 576,
-    h: 135,
-    fps: 5,       // berapa frame per detik yang diambil untuk OCR
-    sigma: 15,    // kekuatan blur subtitle asli
-    fontsize: 12, // ukuran font subtitle baru
-    lang: "ind",  // bahasa OCR (pastikan tesseract-ocr-ind sudah terinstall)
+    h: 300,
+    fps: 5,        // berapa frame per detik yang diambil untuk OCR
+    sigma: 15,     // kekuatan blur subtitle asli
+    fontsize: 12,  // ukuran font subtitle baru
+    lang: "ind",   // bahasa OCR (pastikan tesseract-ocr-ind sudah terinstall)
+    scale: 3,      // faktor upscale area subtitle sebelum OCR (makin tinggi = makin akurat, makin lambat)
+    threshold: 170,// ambang luminosity untuk binarisasi (0-255), dipakai setelah normalisasi per-frame
   };
 
   for (const arg of argv) {
@@ -68,45 +70,98 @@ function getVideoFiles(dir) {
 
 async function extractFrames(inputPath, framesDir, opts) {
   ensureDir(framesDir);
-  // crop area subtitle lalu ambil N frame per detik
+  // Crop area subtitle, ambil N frame per detik, lalu upscale + pertajam.
+  // Upscaling penting: area crop biasanya kecil (tinggi huruf cuma ~30-40px),
+  // dan tesseract jauh lebih akurat di resolusi lebih besar. Unsharp menajamkan
+  // tepi huruf yang buram akibat kompresi video.
   await run("ffmpeg", [
     "-y",
     "-i", inputPath,
-    "-vf", `fps=${opts.fps},crop=${opts.w}:${opts.h}:${opts.x}:${opts.y}`,
+    "-vf",
+    `fps=${opts.fps},crop=${opts.w}:${opts.h}:${opts.x}:${opts.y},` +
+      `scale=${opts.w * opts.scale}:${opts.h * opts.scale}:flags=lanczos,` +
+      `unsharp=5:5:1.0`,
     path.join(framesDir, "f_%04d.png"),
   ]);
 }
 
-// Threshold sederhana pakai ffmpeg (tanpa dependency image processing tambahan):
-// ubah ke grayscale lalu terapkan curves supaya piksel terang (teks putih)
-// jadi hitam di atas latar putih -> lebih gampang dibaca tesseract.
-async function thresholdFrames(framesDir, binDir) {
+// Threshold ganda (dual-polarity) pakai ffmpeg, tanpa dependency image processing
+// tambahan. Kenapa dua varian?
+// - Threshold tunggal (spt versi lama, ">200 -> hitam") cuma menangani kasus teks
+//   lebih terang dari sekitarnya. Begitu latar di area subtitle ikut terang
+//   (langit, baju putih, dll), teksnya ikut ketutup / hilang.
+// - "normalize" dulu supaya rentang kontras tiap frame diregangkan ke 0-255,
+//   jadi satu angka threshold (opts.threshold) lebih konsisten dipakai lintas
+//   frame/scene dibanding pakai nilai mentah.
+// - Varian A: piksel terang -> hitam (asumsi teks/latar terang di atas gelap)
+// - Varian B: piksel gelap  -> hitam (asumsi teks/outline gelap di atas terang)
+// Nanti di tahap OCR, kedua varian dicoba dan yang hasilnya lebih valid dipakai.
+async function thresholdFrames(framesDir, binDir, opts) {
   ensureDir(binDir);
   const files = fs.readdirSync(framesDir).filter((f) => f.endsWith(".png"));
+  const t = opts.threshold;
   for (const file of files) {
+    const base = path.parse(file).name;
     await run("ffmpeg", [
       "-y",
       "-i", path.join(framesDir, file),
-      "-vf", "format=gray,geq=lum='if(gt(lum(X,Y),200),0,255)'",
-      path.join(binDir, file),
+      "-vf", `format=gray,normalize,geq=lum='if(gt(lum(X,Y),${t}),0,255)'`,
+      path.join(binDir, `${base}__a.png`),
+    ]);
+    await run("ffmpeg", [
+      "-y",
+      "-i", path.join(framesDir, file),
+      "-vf", `format=gray,normalize,geq=lum='if(lt(lum(X,Y),${t}),0,255)'`,
+      path.join(binDir, `${base}__b.png`),
     ]);
   }
 }
 
 // ---------- Tahap 2: OCR tiap frame ----------
 
+async function ocrVariant(filePath, lang) {
+  const { stdout } = await run("tesseract", [
+    filePath,
+    "-",
+    "-l", lang,
+    "--psm", "6",
+    "--oem", "1",
+    "--dpi", "300",
+  ]);
+  return stdout.replace(/\s+/g, " ").trim();
+}
+
+// Untuk tiap frame, OCR dua varian threshold (lihat thresholdFrames) lalu pilih
+// yang skor "valid word ratio"-nya lebih tinggi. Ini yang menangani kasus scene
+// terang/gelap campur-campur yang bikin threshold tunggal gagal di sebagian video.
 async function ocrFrames(binDir, lang) {
-  const files = fs.readdirSync(binDir).filter((f) => f.endsWith(".png")).sort();
+  const files = fs
+    .readdirSync(binDir)
+    .filter((f) => f.endsWith("__a.png"))
+    .sort();
   const results = [];
   for (const file of files) {
     const idx = Number(file.match(/(\d+)/)[1]);
-    const { stdout } = await run("tesseract", [
-      path.join(binDir, file),
-      "-",
-      "-l", lang,
-      "--psm", "6",
-    ]);
-    const text = stdout.replace(/\s+/g, " ").trim();
+    const variantAPath = path.join(binDir, file);
+    const variantBPath = variantAPath.replace(/__a\.png$/, "__b.png");
+
+    const textA = await ocrVariant(variantAPath, lang);
+    const textB = fs.existsSync(variantBPath)
+      ? await ocrVariant(variantBPath, lang)
+      : "";
+
+    const scoreA = wordScore(cleanText(textA));
+    const scoreB = wordScore(cleanText(textB));
+    const ratioA = scoreA.total ? scoreA.valid / scoreA.total : 0;
+    const ratioB = scoreB.total ? scoreB.valid / scoreB.total : 0;
+
+    let text;
+    if (ratioA === ratioB) {
+      text = scoreA.total >= scoreB.total ? textA : textB;
+    } else {
+      text = ratioA > ratioB ? textA : textB;
+    }
+
     results.push({ index: idx, text });
   }
   return results;
@@ -322,7 +377,7 @@ async function processVideo(inputPath, outputDir, opts) {
     await extractFrames(inputPath, framesDir, opts);
 
     console.log("  - Threshold frame untuk OCR...");
-    await thresholdFrames(framesDir, binDir);
+    await thresholdFrames(framesDir, binDir, opts);
 
     console.log("  - Menjalankan OCR (bisa agak lama)...");
     const ocrResults = await ocrFrames(binDir, opts.lang);
