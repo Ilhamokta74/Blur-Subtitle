@@ -17,7 +17,7 @@ function parseArgs(argv) {
     h: 135,
     fps: 5,       // berapa frame per detik yang diambil untuk OCR
     sigma: 15,    // kekuatan blur subtitle asli
-    fontsize: 15, // ukuran font subtitle baru
+    fontsize: 12, // ukuran font subtitle baru
     lang: "ind",  // bahasa OCR (pastikan tesseract-ocr-ind sudah terinstall)
   };
 
@@ -279,16 +279,25 @@ function segmentsToSrt(segments) {
 // ---------- Tahap 4: render ulang video (blur lama + subtitle baru) ----------
 
 async function renderVideo(inputPath, srtPath, outputPath, opts) {
+  // Jalankan ffmpeg dengan cwd = folder tempat .srt berada, lalu rujuk .srt
+  // hanya dengan nama filenya saja. Ini menghindari masalah escaping path
+  // (terutama drive letter "C:" di Windows yang bentrok dengan syntax
+  // filter ffmpeg yang juga memakai ':').
+  const srtDir = path.dirname(path.resolve(srtPath));
+  const srtFileName = path.basename(srtPath);
+  const absInput = path.resolve(inputPath);
+  const absOutput = path.resolve(outputPath);
+
   const filterComplex =
     `[0:v]crop=${opts.w}:${opts.h}:${opts.x}:${opts.y},gblur=sigma=${opts.sigma}[b];` +
     `[0:v][b]overlay=${opts.x}:${opts.y}[blurred];` +
-    `[blurred]subtitles=${escapeForFilter(srtPath)}:force_style=` +
+    `[blurred]subtitles=${srtFileName}:force_style=` +
     `'FontName=Arial Bold,FontSize=${opts.fontsize},PrimaryColour=&H00FFFFFF,` +
     `OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=60'[out]`;
 
   await run("ffmpeg", [
     "-y",
-    "-i", inputPath,
+    "-i", absInput,
     "-filter_complex", filterComplex,
     "-map", "[out]",
     "-map", "0:a?",
@@ -296,13 +305,8 @@ async function renderVideo(inputPath, srtPath, outputPath, opts) {
     "-crf", "18",
     "-preset", "medium",
     "-c:a", "copy",
-    outputPath,
-  ]);
-}
-
-function escapeForFilter(p) {
-  // ffmpeg filter path perlu escape karakter khusus seperti ':' dan '\'
-  return p.replace(/\\/g, "/").replace(/:/g, "\\:");
+    absOutput,
+  ], { cwd: srtDir });
 }
 
 // ---------- Orkestrasi per file ----------
@@ -344,10 +348,55 @@ async function processVideo(inputPath, outputDir, opts) {
   }
 }
 
+// ---------- Cek dependency sebelum mulai ----------
+
+async function checkDependency(cmd, versionArgs, installHint) {
+  try {
+    await run(cmd, versionArgs);
+    return true;
+  } catch (err) {
+    console.error(`Tidak bisa menjalankan "${cmd}". ${installHint}`);
+    return false;
+  }
+}
+
+async function checkDependencies(lang) {
+  const ffmpegOk = await checkDependency("ffmpeg", ["-version"],
+    "Install dulu: sudo apt install ffmpeg (Ubuntu/Debian) atau brew install ffmpeg (macOS)."
+  );
+  const tesseractOk = await checkDependency("tesseract", ["--version"],
+    "Install dulu: sudo apt install tesseract-ocr tesseract-ocr-ind (Ubuntu/Debian) atau brew install tesseract tesseract-lang (macOS)."
+  );
+
+  if (tesseractOk) {
+    try {
+      const { stdout } = await run("tesseract", ["--list-langs"]);
+      if (!stdout.includes(lang)) {
+        console.error(
+          `Paket bahasa "${lang}" belum terinstall untuk tesseract. ` +
+          `Install dulu: sudo apt install tesseract-ocr-${lang} (Ubuntu/Debian).`
+        );
+        return false;
+      }
+    } catch (err) {
+      // abaikan, sudah ditangani di checkDependency di atas
+    }
+  }
+
+  return ffmpegOk && tesseractOk;
+}
+
 // ---------- Main ----------
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+
+  const depsOk = await checkDependencies(opts.lang);
+  if (!depsOk) {
+    console.error("\nSetup belum lengkap. Perbaiki hal di atas dulu sebelum menjalankan script ini.");
+    process.exit(1);
+  }
+
   const inputDir = path.resolve(opts.input);
   const outputDir = path.resolve(opts.output);
 

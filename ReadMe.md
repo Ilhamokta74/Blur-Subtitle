@@ -76,15 +76,15 @@ Hasil akhirnya ada 2 file per video:
 
 | Argumen | Default | Keterangan |
 |---|---|---|
-| `--input` | Folder sumber video |
-| `--output` | Folder hasil |
-| `--x` | Posisi kiri area subtitle asli (pixel) |
-| `--y` | Posisi atas area subtitle asli (pixel) |
-| `--w` | Lebar area subtitle asli (pixel) |
-| `--h` | Tinggi area subtitle asli (pixel) |
-| `--fps` | Jumlah frame per detik yang di-OCR (makin besar = makin akurat timing, makin lama prosesnya) |
-| `--sigma` | Kekuatan blur untuk menutup subtitle lama |
-| `--fontsize` | Ukuran font subtitle baru |
+| `--input` | `./input` | Folder sumber video |
+| `--output` | `./output` | Folder hasil |
+| `--x` | `0` | Posisi kiri area subtitle asli (pixel) |
+| `--y` | `645` | Posisi atas area subtitle asli (pixel) |
+| `--w` | `576` | Lebar area subtitle asli (pixel) |
+| `--h` | `135` | Tinggi area subtitle asli (pixel) |
+| `--fps` | `5` | Jumlah frame per detik yang di-OCR (makin besar = makin akurat timing, makin lama prosesnya) |
+| `--sigma` | `15` | Kekuatan blur untuk menutup subtitle lama |
+| `--fontsize` | `10` | Ukuran font subtitle baru |
 | `--lang` | `ind` | Kode bahasa Tesseract untuk OCR |
 
 Contoh custom:
