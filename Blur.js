@@ -9,10 +9,10 @@ function parseArgs(argv) {
     input: "./input",
     output: "./output",
     x: 0,
-    y: 610,
+    y: 645,
     w: 576,
-    h: 170,
-    sigma: 25,
+    h: 135,
+    sigma: 15,
   };
 
   for (const arg of argv) {
