@@ -1,115 +1,121 @@
-# Blur Subtitle Video (Batch) — Node.js
+# Extract & Restyle Subtitle (OCR) — Node.js
 
-Script untuk mem-blur area subtitle (burned-in) pada video secara otomatis.
-Cukup taruh video di folder `input/`, jalankan script, hasilnya muncul di folder `output/`.
+Script ini membaca subtitle yang sudah "terbakar" (burned-in) di video pakai OCR,
+lalu menempelkannya kembali dengan tampilan yang lebih besar dan jelas.
+
+Untuk setiap video di folder `input/`, script akan otomatis:
+1. Crop area subtitle & ambil beberapa frame per detik
+2. Bersihkan (threshold) gambar supaya teks lebih kontras
+3. OCR tiap frame pakai Tesseract (bahasa Indonesia)
+4. Gabungkan hasil OCR jadi baris subtitle lengkap dengan timing → file `.srt`
+5. Blur subtitle asli, lalu tempel subtitle baru yang lebih besar & jelas
+6. Simpan **video hasil** + **file `.srt`** ke folder `output/`
 
 ## Requirement
 
-- **Node.js** versi 14 ke atas
-- **ffmpeg** sudah terinstall dan bisa dipanggil dari terminal
+- **Node.js** 14+
+- **ffmpeg** & **ffprobe**
+- **tesseract-ocr** + paket bahasa Indonesia (`tesseract-ocr-ind`)
 
-Cek apakah ffmpeg sudah ada:
+Install di Ubuntu/Debian:
+
+```bash
+sudo apt install ffmpeg tesseract-ocr tesseract-ocr-ind
+```
+
+Install di macOS (Homebrew):
+
+```bash
+brew install ffmpeg tesseract tesseract-lang
+```
+
+Cek instalasi:
 
 ```bash
 ffmpeg -version
+tesseract --list-langs   # pastikan "ind" muncul di daftar
 ```
-
-Kalau belum ada, install dulu:
-
-| OS | Perintah |
-|---|---|
-| Ubuntu / Debian | `sudo apt install ffmpeg` |
-| macOS (Homebrew) | `brew install ffmpeg` |
-| Windows | Download dari [ffmpeg.org/download.html](https://ffmpeg.org/download.html), lalu tambahkan ke PATH |
 
 ## Struktur Folder
 
-Siapkan folder seperti ini:
-
 ```
 project/
-├── Blur.js
-├── input/        ← taruh semua video di sini
-│   ├── video1.mp4
-│   ├── video2.mp4
-│   └── video3.mov
-└── output/       ← dibuat otomatis, hasil video ter-blur muncul di sini
+├── extract-and-restyle-subtitle.js
+├── input/        ← taruh video di sini
+└── output/       ← dibuat otomatis, isi: video hasil + file .srt
 ```
-
-Kalau folder `input/` atau `output/` belum ada, buat manual:
-
-```bash
-mkdir input output
-```
-
-Lalu pindahkan video-video yang mau diproses ke folder `input/`.
 
 ## Cara Menjalankan
 
-Jalankan dengan pengaturan default:
-
 ```bash
-node Blur.js
+node extract-and-restyle-subtitle.js
 ```
-
-Script akan otomatis:
-
-1. Membaca semua file video di folder `input/` (format `.mp4`, `.mov`, `.mkv`, `.avi`, `.webm`)
-2. Mem-blur area subtitle di setiap video
-3. Menyimpan hasilnya ke folder `output/` dengan nama file yang sama seperti aslinya
-4. Menampilkan progres per file dan ringkasan berhasil/gagal di akhir
 
 Contoh output di terminal:
 
 ```
-Ditemukan 3 video di ./input
+Ditemukan 1 video di ./input
 
-[1/3] Memproses: video1.mp4 ...
-  -> Selesai: /project/output/video1.mp4
+[1/1] Memproses: video1.mp4
+  - Ekstrak frame subtitle...
+  - Threshold frame untuk OCR...
+  - Menjalankan OCR (bisa agak lama)...
+  - Menyusun baris subtitle...
+  - SRT tersimpan: ./output/video1.srt (14 baris)
+  - Render ulang video (blur lama + subtitle baru)...
+  - Video tersimpan: ./output/video1.mp4
 
-[2/3] Memproses: video2.mp4 ...
-  -> Selesai: /project/output/video2.mp4
-
-[3/3] Memproses: video3.mov ...
-  -> Selesai: /project/output/video3.mov
-
-Selesai semua. Berhasil: 3, Gagal: 0
+Selesai semua. Berhasil: 1, Gagal: 0
 ```
 
-## Mengatur Posisi & Ukuran Blur
+Hasil akhirnya ada 2 file per video:
+- `video1.mp4` — video dengan subtitle baru yang lebih jelas
+- `video1.srt` — file subtitle terpisah (bisa dipakai ulang / diedit manual)
 
-Secara default, area yang di-blur diatur untuk video vertikal (576×1024) dengan subtitle di bagian bawah:
+## Pengaturan (Opsional)
 
-| Parameter | Default | Keterangan |
+| Argumen | Default | Keterangan |
 |---|---|---|
-| `--x` | `0` | Posisi kiri area blur (pixel) |
-| `--y` | `610` | Posisi atas area blur (pixel) |
-| `--w` | `576` | Lebar area blur (pixel) |
-| `--h` | `170` | Tinggi area blur (pixel) |
-| `--sigma` | `25` | Tingkat kekuatan blur (semakin besar semakin buram) |
+| `--input` | Folder sumber video |
+| `--output` | Folder hasil |
+| `--x` | Posisi kiri area subtitle asli (pixel) |
+| `--y` | Posisi atas area subtitle asli (pixel) |
+| `--w` | Lebar area subtitle asli (pixel) |
+| `--h` | Tinggi area subtitle asli (pixel) |
+| `--fps` | Jumlah frame per detik yang di-OCR (makin besar = makin akurat timing, makin lama prosesnya) |
+| `--sigma` | Kekuatan blur untuk menutup subtitle lama |
+| `--fontsize` | Ukuran font subtitle baru |
+| `--lang` | `ind` | Kode bahasa Tesseract untuk OCR |
 
-Jika video kamu punya resolusi atau posisi subtitle berbeda, sesuaikan nilainya:
-
-```bash
-node Blur.js --x=0 --y=800 --w=1080 --h=200 --sigma=30
-```
-
-**Cara menentukan koordinat yang pas:**
-1. Ambil satu frame contoh dari video (misalnya pakai `ffmpeg -i input/video1.mp4 -vf "select=eq(n\,50)" -vframes 1 sample.png`)
-2. Buka gambarnya, catat posisi kira-kira di mana subtitle muncul (dari kiri = `x`, dari atas = `y`, lebar = `w`, tinggi = `h`)
-3. Masukkan nilai tersebut sebagai argumen
-
-## Mengatur Folder Input/Output
-
-Kalau tidak mau pakai folder `input/` dan `output/` default:
+Contoh custom:
 
 ```bash
-node Blur.js --input=./videos-mentah --output=./videos-hasil
+node extract-and-restyle-subtitle.js --y=800 --h=200 --fontsize=20 --fps=8
 ```
 
-## Catatan
+**Cara menentukan `--x --y --w --h` yang pas** (kalau video kamu beda resolusi/posisi subtitle):
+1. Ambil satu frame contoh: `ffmpeg -i input/video1.mp4 -ss 5 -vframes 1 sample.png`
+2. Buka gambarnya, perkirakan posisi kotak yang membungkus area subtitle
+3. Masukkan sebagai argumen `--x --y --w --h`
 
-- File asli di folder `input/` **tidak diubah/dihapus** — script hanya membaca lalu menulis hasil baru ke `output/`.
-- Kalau nama file output sudah ada sebelumnya, akan **ditimpa otomatis**.
-- Kalau satu video gagal diproses (misal file rusak), script akan tetap lanjut ke video berikutnya dan melaporkan errornya di akhir.
-- Audio tidak ikut diproses ulang (di-copy langsung) supaya lebih cepat dan tidak kehilangan kualitas.
+## Keterbatasan (Penting)
+
+- **OCR tidak 100% akurat**, terutama pada frame yang blur karena gerakan kamera cepat.
+  Selalu **cek file `.srt` yang dihasilkan** dan koreksi manual kalau ada baris yang aneh
+  sebelum dipakai untuk keperluan penting.
+- Proses ini cukup berat (ekstrak + OCR ratusan frame per video), jadi butuh waktu — video
+  30 detik bisa makan waktu 1-2 menit tergantung spesifikasi komputer.
+- Semakin banyak gerakan kamera / latar belakang terang di area subtitle, semakin besar
+  kemungkinan OCR salah baca. Menaikkan `--fps` bisa membantu tapi juga menambah waktu proses.
+- Font subtitle baru pakai `Arial Bold`. Kalau font itu tidak tersedia di sistem, ffmpeg akan
+  otomatis pakai font default — ganti `FontName` di dalam script (bagian `renderVideo`) kalau
+  mau font lain.
+
+## Troubleshooting
+
+| Masalah | Solusi |
+|---|---|
+| `tesseract: command not found` | Install tesseract-ocr (lihat bagian Requirement) |
+| Hasil OCR kosong / banyak salah | Cek posisi `--x --y --w --h` sudah pas menutupi area subtitle |
+| Error `Unable to open... .srt` saat render | Pastikan path folder tidak mengandung karakter aneh; jalankan dari folder project langsung |
+| Subtitle baru miring/salah posisi | Sesuaikan `MarginV` dan `Alignment` di bagian `force_style` dalam script |
