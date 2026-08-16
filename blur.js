@@ -42,7 +42,39 @@ function getVideoFiles(dir) {
     .sort();
 }
 
-function blurSubtitle({ input, output, x, y, w, h, sigma }) {
+// Ambil durasi video (detik) pakai ffprobe, dipakai buat hitung persentase progress
+function getDuration(input) {
+  return new Promise((resolve) => {
+    const ffprobe = spawn("ffprobe", [
+      "-v", "error",
+      "-show_entries", "format=duration",
+      "-of", "default=noprint_wrappers=1:nokey=1",
+      input,
+    ]);
+
+    let out = "";
+    ffprobe.stdout.on("data", (d) => (out += d.toString()));
+    ffprobe.on("close", () => {
+      const dur = parseFloat(out.trim());
+      resolve(Number.isFinite(dur) ? dur : 0);
+    });
+    ffprobe.on("error", () => resolve(0)); // kalau ffprobe gak ada, tetap lanjut tanpa persen
+  });
+}
+
+function formatTime(sec) {
+  if (!Number.isFinite(sec) || sec < 0) sec = 0;
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function renderBar(percent, width = 24) {
+  const filled = Math.round((percent / 100) * width);
+  return "█".repeat(filled) + "░".repeat(Math.max(0, width - filled));
+}
+
+function blurSubtitle({ input, output, x, y, w, h, sigma, duration, onProgress }) {
   return new Promise((resolve, reject) => {
     const filterComplex =
       `[0:v]crop=${w}:${h}:${x}:${y},gblur=sigma=${sigma}[blurred];` +
@@ -58,10 +90,30 @@ function blurSubtitle({ input, output, x, y, w, h, sigma }) {
       "-crf", "18",
       "-preset", "medium",
       "-c:a", "copy",
+      "-progress", "pipe:1", // kirim status progress ke stdout, format key=value
+      "-nostats",
       output,
     ];
 
     const ffmpeg = spawn("ffmpeg", ffmpegArgs);
+
+    let stdoutBuf = "";
+    ffmpeg.stdout.on("data", (chunk) => {
+      stdoutBuf += chunk.toString();
+      const lines = stdoutBuf.split("\n");
+      stdoutBuf = lines.pop(); // sisa baris belum lengkap, simpan buat chunk berikutnya
+
+      for (const line of lines) {
+        const [key, value] = line.split("=");
+        if (key === "out_time_ms" && duration > 0) {
+          const currentSec = Number(value) / 1_000_000;
+          const percent = Math.min(100, (currentSec / duration) * 100);
+          onProgress?.(percent, currentSec);
+        } else if (key === "progress" && value === "end") {
+          onProgress?.(100, duration);
+        }
+      }
+    });
 
     ffmpeg.stderr.on("data", () => {
       // diamkan log detail ffmpeg supaya output batch bersih
@@ -107,7 +159,9 @@ async function run() {
     const inputPath = path.join(inputDir, file);
     const outputPath = path.join(outputDir, `[Blur] ${file}`);
 
-    console.log(`[${i + 1}/${files.length}] Memproses: ${file} ...`);
+    console.log(`[${i + 1}/${files.length}] Memproses: ${file}`);
+
+    const duration = await getDuration(inputPath);
 
     try {
       await blurSubtitle({
@@ -118,10 +172,20 @@ async function run() {
         w: opts.w,
         h: opts.h,
         sigma: opts.sigma,
+        duration,
+        onProgress: (percent, currentSec) => {
+          const bar = renderBar(percent);
+          const timeInfo = duration > 0 ? `${formatTime(currentSec)}/${formatTime(duration)}` : "";
+          process.stdout.write(
+            `\r  [${bar}] ${percent.toFixed(1)}% ${timeInfo}   `
+          );
+        },
       });
+      process.stdout.write("\n");
       console.log(`  -> Selesai: ${outputPath}\n`);
       success++;
     } catch (err) {
+      process.stdout.write("\n");
       console.error(`  -> Gagal: ${err.message}\n`);
       failed++;
     }
