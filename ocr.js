@@ -15,9 +15,9 @@ function parseArgs(argv) {
     y: 600,
     w: 576,
     h: 200,
-    fps: 10,       // berapa frame per detik yang diambil untuk OCR
+    fps: 15,       // berapa frame per detik yang diambil untuk OCR
     sigma: 15,    // kekuatan blur subtitle asli
-    fontsize: 12, // ukuran font subtitle baru
+    fontsize: 11, // ukuran font subtitle baru
     lang: "ind",  // bahasa OCR (pastikan tesseract-ocr-ind sudah terinstall)
     scale: 3,      // faktor upscale sebelum OCR (huruf kecil -> OCR jelek)
     threshold: 200, // ambang luma untuk binarisasi (turunkan kalau subtitle kuning/redup)
@@ -188,7 +188,7 @@ function levenshtein(a, b) {
   return dp[m][n];
 }
 
-const WORD_RE = /^[A-Za-zÀ-ÿ'\-]{2,}[.,!?]?$/;
+const WORD_RE = /^(?:[A-Za-zÀ-ÿ'\-]{2,}[.,!?]?|[0-9]+[.,!?]?)$/;
 
 function wordScore(text) {
   const words = text.split(" ").filter(Boolean);
@@ -202,6 +202,20 @@ function trimToValidPrefix(text) {
   for (const w of words) {
     if (WORD_RE.test(w)) out.push(w);
     else break;
+  }
+  return out.join(" ");
+}
+
+// Buang kata yang berulang persis di posisi berurutan ("gaji gaji" -> "gaji").
+// Ini artefak umum dari konsensus per-kata / batas antar frame OCR, bukan
+// pengulangan asli dari pembicara.
+function collapseDuplicateWords(text) {
+  const words = text.split(" ").filter(Boolean);
+  const out = [];
+  for (const w of words) {
+    if (out.length === 0 || out[out.length - 1].toLowerCase() !== w.toLowerCase()) {
+      out.push(w);
+    }
   }
   return out.join(" ");
 }
@@ -270,13 +284,13 @@ function pickBest(candidates) {
     const { valid, total } = wordScore(text);
     if (total === 0) continue;
     const ratio = valid / total;
-    const score = { ratio, valid, cnt, negLen: -text.length, text };
+    const score = { ratio, cnt, valid, negLen: -text.length, text };
     if (
       !best ||
       score.ratio > best.ratio ||
-      (score.ratio === best.ratio && score.valid > best.valid) ||
-      (score.ratio === best.ratio && score.valid === best.valid && score.cnt > best.cnt) ||
-      (score.ratio === best.ratio && score.valid === best.valid && score.cnt === best.cnt && score.negLen > best.negLen)
+      (score.ratio === best.ratio && score.cnt > best.cnt) ||
+      (score.ratio === best.ratio && score.cnt === best.cnt && score.valid > best.valid) ||
+      (score.ratio === best.ratio && score.cnt === best.cnt && score.valid === best.valid && score.negLen > best.negLen)
     ) {
       best = score;
     }
@@ -307,7 +321,7 @@ function groupIntoSegments(ocrResults, fps) {
     const end = cur[cur.length - 1].t + frameDt;
     const best = pickBest(cur.map((c) => c.text));
     if (best && end - start >= 0.3) {
-      const trimmed = trimToValidPrefix(best);
+      const trimmed = collapseDuplicateWords(trimToValidPrefix(best));
       if (trimmed) {
         const { total } = wordScore(trimmed);
         if (total >= 1 && trimmed.length >= 4 && (total >= 2 || trimmed.length >= 6)) {
