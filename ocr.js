@@ -12,13 +12,17 @@ function parseArgs(argv) {
     input: "./input",
     output: "./output",
     x: 0,
-    y: 645,
+    y: 600,
     w: 576,
-    h: 135,
-    fps: 5,       // berapa frame per detik yang diambil untuk OCR
+    h: 200,
+    fps: 10,       // berapa frame per detik yang diambil untuk OCR
     sigma: 15,    // kekuatan blur subtitle asli
     fontsize: 12, // ukuran font subtitle baru
     lang: "ind",  // bahasa OCR (pastikan tesseract-ocr-ind sudah terinstall)
+    scale: 3,      // faktor upscale sebelum OCR (huruf kecil -> OCR jelek)
+    threshold: 200, // ambang luma untuk binarisasi (turunkan kalau subtitle kuning/redup)
+    minConf: 40,   // buang kata hasil OCR dengan confidence < nilai ini (0-100)
+    psm: 6,        // 6 = blok teks (multi-baris), 7 = satu baris saja
   };
 
   for (const arg of argv) {
@@ -77,25 +81,56 @@ async function extractFrames(inputPath, framesDir, opts) {
   ]);
 }
 
-// Threshold sederhana pakai ffmpeg (tanpa dependency image processing tambahan):
-// ubah ke grayscale lalu terapkan curves supaya piksel terang (teks putih)
-// jadi hitam di atas latar putih -> lebih gampang dibaca tesseract.
-async function thresholdFrames(framesDir, binDir) {
+// Threshold pakai ffmpeg (tanpa dependency image processing tambahan):
+// ubah ke grayscale, UPSCALE (huruf kecil = musuh utama akurasi Tesseract),
+// sharpen dikit supaya tepi huruf tegas lagi setelah discale, baru threshold
+// supaya piksel terang (teks putih) jadi hitam di atas latar putih.
+//
+// Diproses sebagai satu image-sequence (bukan loop spawn per file) - jauh
+// lebih cepat untuk video dengan ratusan/ribuan frame.
+async function thresholdFrames(framesDir, binDir, opts = {}) {
   ensureDir(binDir);
   const files = fs.readdirSync(framesDir).filter((f) => f.endsWith(".png"));
-  for (const file of files) {
-    await run("ffmpeg", [
-      "-y",
-      "-i", path.join(framesDir, file),
-      "-vf", "format=gray,geq=lum='if(gt(lum(X,Y),200),0,255)'",
-      path.join(binDir, file),
-    ]);
-  }
+  if (files.length === 0) return;
+
+  const scale = opts.scale ?? 3;
+  const thr = opts.threshold ?? 200;
+
+  await run("ffmpeg", [
+    "-y",
+    "-i", path.join(framesDir, "f_%04d.png"),
+    "-vf",
+    `format=gray,scale=iw*${scale}:ih*${scale}:flags=lanczos,` +
+    `unsharp=5:5:1.0,` +
+    `median=radius=1,` +
+    `geq=lum='if(gt(lum(X,Y),${thr}),0,255)'`,
+    path.join(binDir, "f_%04d.png"),
+  ]);
 }
 
 // ---------- Tahap 2: OCR tiap frame ----------
 
-async function ocrFrames(binDir, lang) {
+// Parse output TSV Tesseract (`tesseract ... tsv`) dan buang kata dengan
+// confidence di bawah minConf. Ini penting karena noise sisa threshold
+// (bercak, artefak upscale, dll) biasanya menghasilkan "kata" acak dengan
+// confidence rendah - kalau ikut divoting di pickBest(), bisa mengalahkan
+// hasil bacaan yang benar tapi kurang sering muncul persis sama.
+function tsvToText(tsv, minConf) {
+  const lines = tsv.split("\n").slice(1); // baris pertama = header
+  const words = [];
+  for (const line of lines) {
+    const cols = line.split("\t");
+    if (cols.length < 12) continue;
+    const conf = Number(cols[10]);
+    const text = cols[11];
+    if (!text || !text.trim()) continue;
+    if (Number.isFinite(conf) && conf < minConf) continue;
+    words.push(text.trim());
+  }
+  return words.join(" ");
+}
+
+async function ocrFrames(binDir, opts) {
   const files = fs.readdirSync(binDir).filter((f) => f.endsWith(".png")).sort();
   const results = [];
   for (const file of files) {
@@ -103,10 +138,14 @@ async function ocrFrames(binDir, lang) {
     const { stdout } = await run("tesseract", [
       path.join(binDir, file),
       "-",
-      "-l", lang,
-      "--psm", "6",
+      "-l", opts.lang,
+      "--psm", String(opts.psm ?? 6),
+      "--oem", "1",       // paksa pakai LSTM engine (lebih akurat dari legacy)
+      "--dpi", "300",     // frame sudah discale, kasih tau dpi biar LSTM konsisten
+      "-c", "tessedit_do_invert=0", // jangan auto-invert, kita sudah binarisasi manual
+      "tsv",
     ]);
-    const text = stdout.replace(/\s+/g, " ").trim();
+    const text = tsvToText(stdout, opts.minConf ?? 40);
     results.push({ index: idx, text });
   }
   return results;
@@ -167,9 +206,64 @@ function trimToValidPrefix(text) {
   return out.join(" ");
 }
 
+// Konsensus per-kata: kelompokkan kandidat berdasarkan jumlah kata (OCR yang
+// bagus biasanya sepakat soal jumlah kata walau isi katanya kadang beda tipis),
+// lalu untuk tiap posisi kata, ambil versi yang paling sering muncul di posisi
+// itu. Ini menangkap kasus di mana tidak ada satupun string yang identik persis
+// sesering itu, tapi mayoritas kata per-posisi sebenarnya konsisten benar.
+//
+// `support` = jumlah kandidat yang dipakai untuk membangun konsensus ini -
+// dipakai sebagai bobot suara pengganti "cnt", supaya hasil konsensus tidak
+// kalah cuma gara-gara tidak ada satupun string identik yang sering.
+function pickBestConsensus(candidates) {
+  const byLen = {};
+  for (const c of candidates) {
+    const words = c.split(" ").filter(Boolean);
+    if (words.length === 0) continue;
+    (byLen[words.length] ??= []).push(words);
+  }
+
+  let bestLen = null;
+  let bestCount = -1;
+  for (const [len, groups] of Object.entries(byLen)) {
+    if (groups.length > bestCount) {
+      bestCount = groups.length;
+      bestLen = len;
+    }
+  }
+  if (bestLen === null) return null;
+
+  const groups = byLen[bestLen];
+  const wordCount = Number(bestLen);
+  const consensus = [];
+  for (let i = 0; i < wordCount; i++) {
+    const counts = {};
+    for (const g of groups) counts[g[i]] = (counts[g[i]] || 0) + 1;
+    let bestWord = null;
+    let bestWordCount = -1;
+    for (const [w, c] of Object.entries(counts)) {
+      if (c > bestWordCount) {
+        bestWordCount = c;
+        bestWord = w;
+      }
+    }
+    consensus.push(bestWord);
+  }
+  return { text: consensus.join(" "), support: groups.length };
+}
+
 function pickBest(candidates) {
   const counts = {};
   for (const c of candidates) counts[c] = (counts[c] || 0) + 1;
+
+  // Konsensus per-kata ikut bersaing lewat scoring yang sama di bawah, dengan
+  // bobot suara ("cnt") = jumlah kandidat yang menyumbang ke konsensus ini -
+  // biasanya lebih tinggi dari cnt exact-match manapun, jadi ini menang kalau
+  // memang mayoritas kata sepakat walau tidak ada string yang identik persis.
+  const consensus = pickBestConsensus(candidates);
+  if (consensus) {
+    counts[consensus.text] = Math.max(counts[consensus.text] || 0, consensus.support);
+  }
 
   let best = null;
   for (const [text, cnt] of Object.entries(counts)) {
@@ -322,10 +416,10 @@ async function processVideo(inputPath, outputDir, opts) {
     await extractFrames(inputPath, framesDir, opts);
 
     console.log("  - Threshold frame untuk OCR...");
-    await thresholdFrames(framesDir, binDir);
+    await thresholdFrames(framesDir, binDir, opts);
 
     console.log("  - Menjalankan OCR (bisa agak lama)...");
-    const ocrResults = await ocrFrames(binDir, opts.lang);
+    const ocrResults = await ocrFrames(binDir, opts);
 
     console.log("  - Menyusun baris subtitle...");
     const segments = groupIntoSegments(ocrResults, opts.fps);
