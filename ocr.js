@@ -11,10 +11,19 @@ function parseArgs(argv) {
   const args = {
     input: "./input",
     output: "./output",
+    // Area crop untuk BLUR (dipakai di renderVideo, nutup subtitle asli).
     x: 0,
-    y: 600,
+    y: 630,
     w: 576,
-    h: 200,
+    h: 150,
+    // Area crop untuk OCR (dipakai di extractFrames, dibaca Tesseract).
+    // Dibikin terpisah dari area blur karena kadang perlu jangkauan lebih
+    // lebar/tinggi biar OCR tetap kebaca meski areanya tidak identik
+    // dengan area yang mau di-blur.
+    ocrX: 0,
+    ocrY: 600,
+    ocrW: 576,
+    ocrH: 200,
     fps: 15,       // berapa frame per detik yang diambil untuk OCR
     sigma: 15,    // kekuatan blur subtitle asli
     fontsize: 11, // ukuran font subtitle baru
@@ -23,6 +32,8 @@ function parseArgs(argv) {
     threshold: 200, // ambang luma untuk binarisasi (turunkan kalau subtitle kuning/redup)
     minConf: 40,   // buang kata hasil OCR dengan confidence < nilai ini (0-100)
     psm: 6,        // 6 = blok teks (multi-baris), 7 = satu baris saja
+    marginv: 100,  // jarak subtitle baru dari bawah frame (makin besar makin ke atas)
+    outline: 0.5,  // ketebalan border/outline teks subtitle (bisa desimal, mis. 0.5)
   };
 
   for (const arg of argv) {
@@ -61,6 +72,110 @@ function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
+// ---------- Progress bar ----------
+
+// Bobot tiap tahap terhadap progres KESELURUHAN 1 video - dipakai supaya
+// user bisa lihat "udah sampai mana" secara total, bukan cuma persen di
+// tahap yang lagi jalan. OCR dikasih bobot paling besar karena paling
+// lama (loop tesseract per-frame), penting buat video 60-180 menit.
+const STAGE_WEIGHTS = {
+  extract: 0.15,
+  threshold: 0.15,
+  ocr: 0.6,
+  render: 0.1,
+};
+function formatBar(pct, width = 24) {
+  const clamped = Math.min(1, Math.max(0, pct || 0));
+  const filled = Math.round(width * clamped);
+  return `[${"#".repeat(filled)}${"-".repeat(width - filled)}]`;
+}
+
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) seconds = 0;
+  const s = Math.round(seconds);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const pad = (n) => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${pad(m)}:${pad(sec)}`;
+}
+
+// label: teks tahap yang lagi jalan, pct: progres tahap ini (0-1).
+// ctx (opsional): { videoStart, stageKey } - kalau diisi, baris progress
+// juga menghitung progres TOTAL 1 video (gabungan semua tahap) plus
+// elapsed time & estimasi sisa waktu (ETA).
+function printProgress(label, pct, extra = "", ctx = null) {
+  const clamped = Math.min(1, Math.max(0, pct || 0));
+  let overallInfo = "";
+  if (ctx) {
+    const keys = Object.keys(STAGE_WEIGHTS);
+    const idx = keys.indexOf(ctx.stageKey);
+    const before = keys.slice(0, idx).reduce((a, k) => a + STAGE_WEIGHTS[k], 0);
+    const overall = before + STAGE_WEIGHTS[ctx.stageKey] * clamped;
+    const elapsed = (Date.now() - ctx.videoStart) / 1000;
+    const eta = overall > 0.005 ? (elapsed / overall) * (1 - overall) : 0;
+    overallInfo = ` | total ${(overall * 100).toFixed(1)}% | elapsed ${formatDuration(elapsed)} | ETA ${formatDuration(eta)}`;
+  }
+  const line = `  - ${label} ${formatBar(clamped)} ${(clamped * 100).toFixed(1)}% ${extra}${overallInfo}`;
+  process.stdout.write(`\r${line.padEnd(120)}`);
+}
+
+function finishProgress() {
+  process.stdout.write("\n");
+}
+
+// Ambil durasi video (detik) lewat ffprobe, dipakai buat basis progress bar.
+async function getDuration(inputPath) {
+  try {
+    const { stdout } = await run("ffprobe", [
+      "-v", "error",
+      "-show_entries", "format=duration",
+      "-of", "default=noprint_wrappers=1:nokey=1",
+      inputPath,
+    ]);
+    const d = parseFloat(stdout.trim());
+    return Number.isFinite(d) ? d : 0;
+  } catch {
+    return 0;
+  }
+}
+
+// Jalankan ffmpeg sambil parsing output "-progress pipe:1" (format
+// key=value per baris, tiap blok progress ditutup baris "progress=...").
+// onEvent dipanggil dengan objek key-value tiap blok progress selesai.
+function runFfmpegProgress(args, onEvent, options = {}) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("ffmpeg", ["-y", ...args, "-progress", "pipe:1", "-nostats"], options);
+    let cur = {};
+    let buf = "";
+    let stderr = "";
+    proc.stdout?.on("data", (d) => {
+      buf += d.toString();
+      const lines = buf.split("\n");
+      buf = lines.pop();
+      for (const line of lines) {
+        const idx = line.indexOf("=");
+        if (idx === -1) continue;
+        const key = line.slice(0, idx).trim();
+        const value = line.slice(idx + 1).trim();
+        cur[key] = value;
+        if (key === "progress") {
+          onEvent(cur);
+          cur = {};
+        }
+      }
+    });
+    proc.stderr?.on("data", (d) => (stderr += d.toString()));
+    proc.on("error", (err) =>
+      reject(new Error(`Gagal menjalankan ffmpeg: ${err.message}`))
+    );
+    proc.on("close", (code) => {
+      if (code === 0) resolve({ stderr });
+      else reject(new Error(`ffmpeg keluar dengan kode ${code}\n${stderr}`));
+    });
+  });
+}
+
 function getVideoFiles(dir) {
   return fs
     .readdirSync(dir)
@@ -70,15 +185,24 @@ function getVideoFiles(dir) {
 
 // ---------- Tahap 1: ekstrak & threshold frame area subtitle ----------
 
-async function extractFrames(inputPath, framesDir, opts) {
+async function extractFrames(inputPath, framesDir, opts, ctx) {
   ensureDir(framesDir);
-  // crop area subtitle lalu ambil N frame per detik
-  await run("ffmpeg", [
-    "-y",
-    "-i", inputPath,
-    "-vf", `fps=${opts.fps},crop=${opts.w}:${opts.h}:${opts.x}:${opts.y}`,
-    path.join(framesDir, "f_%04d.png"),
-  ]);
+  const duration = await getDuration(inputPath);
+  // crop area SUBTITLE UNTUK OCR (beda dari area blur) lalu ambil N frame per detik
+  await runFfmpegProgress(
+    [
+      "-i", inputPath,
+      "-vf", `fps=${opts.fps},crop=${opts.ocrW}:${opts.ocrH}:${opts.ocrX}:${opts.ocrY}`,
+      path.join(framesDir, "f_%04d.png"),
+    ],
+    (ev) => {
+      const outMs = Number(ev.out_time_ms);
+      if (duration > 0 && Number.isFinite(outMs)) {
+        printProgress("[1/4] Ekstrak frame subtitle", outMs / 1e6 / duration, "", { ...ctx, stageKey: "extract" });
+      }
+    }
+  );
+  finishProgress();
 }
 
 // Threshold pakai ffmpeg (tanpa dependency image processing tambahan):
@@ -88,24 +212,38 @@ async function extractFrames(inputPath, framesDir, opts) {
 //
 // Diproses sebagai satu image-sequence (bukan loop spawn per file) - jauh
 // lebih cepat untuk video dengan ratusan/ribuan frame.
-async function thresholdFrames(framesDir, binDir, opts = {}) {
+async function thresholdFrames(framesDir, binDir, opts = {}, ctx) {
   ensureDir(binDir);
   const files = fs.readdirSync(framesDir).filter((f) => f.endsWith(".png"));
   if (files.length === 0) return;
 
   const scale = opts.scale ?? 3;
   const thr = opts.threshold ?? 200;
+  const total = files.length;
 
-  await run("ffmpeg", [
-    "-y",
-    "-i", path.join(framesDir, "f_%04d.png"),
-    "-vf",
-    `format=gray,scale=iw*${scale}:ih*${scale}:flags=lanczos,` +
-    `unsharp=5:5:1.0,` +
-    `median=radius=1,` +
-    `geq=lum='if(gt(lum(X,Y),${thr}),0,255)'`,
-    path.join(binDir, "f_%04d.png"),
-  ]);
+  await runFfmpegProgress(
+    [
+      "-i", path.join(framesDir, "f_%04d.png"),
+      "-vf",
+      `format=gray,scale=iw*${scale}:ih*${scale}:flags=lanczos,` +
+      `unsharp=5:5:1.0,` +
+      `median=radius=1,` +
+      `geq=lum='if(gt(lum(X,Y),${thr}),0,255)'`,
+      path.join(binDir, "f_%04d.png"),
+    ],
+    (ev) => {
+      const frame = Number(ev.frame);
+      if (total > 0 && Number.isFinite(frame)) {
+        printProgress(
+          "[2/4] Threshold frame untuk OCR",
+          frame / total,
+          `(${Math.min(frame, total)}/${total})`,
+          { ...ctx, stageKey: "threshold" }
+        );
+      }
+    }
+  );
+  finishProgress();
 }
 
 // ---------- Tahap 2: OCR tiap frame ----------
@@ -130,10 +268,12 @@ function tsvToText(tsv, minConf) {
   return words.join(" ");
 }
 
-async function ocrFrames(binDir, opts) {
+async function ocrFrames(binDir, opts, ctx) {
   const files = fs.readdirSync(binDir).filter((f) => f.endsWith(".png")).sort();
   const results = [];
-  for (const file of files) {
+  const total = files.length;
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
     const idx = Number(file.match(/(\d+)/)[1]);
     const { stdout } = await run("tesseract", [
       path.join(binDir, file),
@@ -147,7 +287,14 @@ async function ocrFrames(binDir, opts) {
     ]);
     const text = tsvToText(stdout, opts.minConf ?? 40);
     results.push({ index: idx, text });
+    printProgress(
+      "[3/4] Menjalankan OCR",
+      (i + 1) / total,
+      `(${i + 1}/${total})`,
+      { ...ctx, stageKey: "ocr" }
+    );
   }
+  finishProgress();
   return results;
 }
 
@@ -386,7 +533,7 @@ function segmentsToSrt(segments) {
 
 // ---------- Tahap 4: render ulang video (blur lama + subtitle baru) ----------
 
-async function renderVideo(inputPath, srtPath, outputPath, opts) {
+async function renderVideo(inputPath, srtPath, outputPath, opts, ctx) {
   // Jalankan ffmpeg dengan cwd = folder tempat .srt berada, lalu rujuk .srt
   // hanya dengan nama filenya saja. Ini menghindari masalah escaping path
   // (terutama drive letter "C:" di Windows yang bentrok dengan syntax
@@ -401,20 +548,31 @@ async function renderVideo(inputPath, srtPath, outputPath, opts) {
     `[0:v][b]overlay=${opts.x}:${opts.y}[blurred];` +
     `[blurred]subtitles=${srtFileName}:force_style=` +
     `'FontName=Arial Bold,FontSize=${opts.fontsize},PrimaryColour=&H00FFFFFF,` +
-    `OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=60'[out]`;
+    `OutlineColour=&H00000000,BorderStyle=1,Outline=${opts.outline ?? 1},Shadow=0,Alignment=2,MarginV=80'[out]`;
 
-  await run("ffmpeg", [
-    "-y",
-    "-i", absInput,
-    "-filter_complex", filterComplex,
-    "-map", "[out]",
-    "-map", "0:a?",
-    "-c:v", "libx264",
-    "-crf", "18",
-    "-preset", "medium",
-    "-c:a", "copy",
-    absOutput,
-  ], { cwd: srtDir });
+  const duration = await getDuration(absInput);
+
+  await runFfmpegProgress(
+    [
+      "-i", absInput,
+      "-filter_complex", filterComplex,
+      "-map", "[out]",
+      "-map", "0:a?",
+      "-c:v", "libx264",
+      "-crf", "18",
+      "-preset", "medium",
+      "-c:a", "copy",
+      absOutput,
+    ],
+    (ev) => {
+      const outMs = Number(ev.out_time_ms);
+      if (duration > 0 && Number.isFinite(outMs)) {
+        printProgress("[4/4] Render ulang video", outMs / 1e6 / duration, "", { ...ctx, stageKey: "render" });
+      }
+    },
+    { cwd: srtDir }
+  );
+  finishProgress();
 }
 
 // ---------- Orkestrasi per file ----------
@@ -425,15 +583,15 @@ async function processVideo(inputPath, outputDir, opts) {
   const framesDir = path.join(tmpDir, "frames");
   const binDir = path.join(tmpDir, "frames_bin");
 
+  // ctx dipakai bareng di semua tahap supaya progress bar bisa menghitung
+  // progres TOTAL 1 video (bukan cuma tahap yang lagi jalan) + elapsed/ETA -
+  // penting untuk video panjang (60-180 menit).
+  const ctx = { videoStart: Date.now() };
+
   try {
-    console.log("  - Ekstrak frame subtitle...");
-    await extractFrames(inputPath, framesDir, opts);
-
-    console.log("  - Threshold frame untuk OCR...");
-    await thresholdFrames(framesDir, binDir, opts);
-
-    console.log("  - Menjalankan OCR (bisa agak lama)...");
-    const ocrResults = await ocrFrames(binDir, opts);
+    await extractFrames(inputPath, framesDir, opts, ctx);
+    await thresholdFrames(framesDir, binDir, opts, ctx);
+    const ocrResults = await ocrFrames(binDir, opts, ctx);
 
     console.log("  - Menyusun baris subtitle...");
     const segments = groupIntoSegments(ocrResults, opts.fps);
@@ -448,9 +606,9 @@ async function processVideo(inputPath, outputDir, opts) {
     console.log(`  - SRT tersimpan: ${srtPath} (${segments.length} baris)`);
 
     const outVideoPath = path.join(outputDir, `${baseName}${path.extname(inputPath)}`);
-    console.log("  - Render ulang video (blur lama + subtitle baru)...");
-    await renderVideo(inputPath, srtPath, outVideoPath, opts);
+    await renderVideo(inputPath, srtPath, outVideoPath, opts, ctx);
     console.log(`  - Video tersimpan: ${outVideoPath}`);
+    console.log(`  - Total waktu proses: ${formatDuration((Date.now() - ctx.videoStart) / 1000)}`);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
