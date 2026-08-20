@@ -605,7 +605,7 @@ async function processVideo(inputPath, outputDir, opts) {
     fs.writeFileSync(srtPath, segmentsToSrt(segments), "utf-8");
     console.log(`  - SRT tersimpan: ${srtPath} (${segments.length} baris)`);
 
-    const outVideoPath = path.join(outputDir, `${baseName}${path.extname(inputPath)}`);
+    const outVideoPath = path.join(outputDir, `[Subtitle] ${baseName}${path.extname(inputPath)}`);
     await renderVideo(inputPath, srtPath, outVideoPath, opts, ctx);
     console.log(`  - Video tersimpan: ${outVideoPath}`);
     console.log(`  - Total waktu proses: ${formatDuration((Date.now() - ctx.videoStart) / 1000)}`);
