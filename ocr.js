@@ -601,7 +601,7 @@ async function processVideo(inputPath, outputDir, opts) {
       return;
     }
 
-    const srtPath = path.join(outputDir, `${baseName}.srt`);
+    const srtPath = path.join(outputDir, `./Subtitle/${baseName}.srt`);
     fs.writeFileSync(srtPath, segmentsToSrt(segments), "utf-8");
     console.log(`  - SRT tersimpan: ${srtPath} (${segments.length} baris)`);
 
